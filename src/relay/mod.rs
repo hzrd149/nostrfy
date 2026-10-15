@@ -3213,7 +3213,8 @@ impl Relay {
         }
         // Drain and record in the same pass: the writer shed the deletion
         // moments ago and may still be full, in which case the requests stay
-        // held and the next event retries the flush.
+        // held until another failed removal retries the flush (there is no
+        // periodic flush and no other caller).
         let drained: Vec<crate::db::store::PendingDeletion> = {
             let mut held = self
                 .pending_removals
@@ -3850,11 +3851,11 @@ impl Relay {
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
         // must still be distinguishable, or the NIP-01 id tie-break could
-        // let a stale, later-committed version win. The floor is clamped
-        // to `now`: a group event may carry a future created_at (allowed
-        // up to max_created_at_future_secs), and stamping the metadata in
-        // the future would make it invisible to `until: now` scans and,
-        // after a restart, unreplaceable until the wall clock catches up.
+        // let a stale, later-committed version win. Passing `now` only
+        // raises the floor; the clock never moves backwards, so sustained
+        // group activity stamps metadata ahead of the wall clock, which
+        // hides it from `until: now` scans (and delays replacement until
+        // wall time catches up after a restart).
         let stamp = self.stamp_floor(now);
         let mut buffer = self.groups_rebuild.buffer.lock().await;
         if buffer.scanning {
