@@ -9805,7 +9805,10 @@ mod tests {
     async fn ws_next_json<S>(ws: &mut S) -> Value
     where
         S: futures_util::Stream<
-                Item = Result<tokio_tungstenite::tungstenite::Message, tungstenite::Error>,
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
             > + Unpin,
     {
         let deadline = tokio::time::sleep(Duration::from_secs(5));
@@ -9971,7 +9974,10 @@ mod tests {
     async fn ws_next_text<S>(ws: &mut S) -> Option<String>
     where
         S: futures_util::Stream<
-                Item = Result<tokio_tungstenite::tungstenite::Message, tungstenite::Error>,
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
             > + Unpin,
     {
         let deadline = tokio::time::sleep(Duration::from_secs(5));
