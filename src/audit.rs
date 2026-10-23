@@ -72,6 +72,13 @@ impl AuditLog {
     /// the window so a grantee cannot hide an admin mutation by exhausting
     /// the global budget first.
     pub(crate) fn log_for(&self, identity: String, admin: bool, entry: String) {
+        // Hex pubkeys are case-insensitive and the grant/replay checks
+        // compare them that way. Keying the per-identity budget by the raw
+        // spelling let one grantee alternate the case of its hex pubkey and
+        // multiply its quota (suppressing other grantees' entries), so
+        // canonicalize the key here. The entry text keeps the spelling the
+        // caller used.
+        let identity = identity.to_ascii_lowercase();
         // A poisoned mutex (a thread panicked while holding it) must not
         // take the audit log down: the state is still valid, so the
         // guard is recovered with `into_inner`.
@@ -85,8 +92,8 @@ impl AuditLog {
                 // Bypass the level/target filter: the summary is part of
                 // the audit trail, not routine logging.
                 crate::logging::write_audit_entry(format_args!(
-                    "admin audit log throttled: {} management entries suppressed in the last {}s",
-                    state.suppressed, WINDOW_SECS
+                    "admin audit log throttled: {} management entries suppressed since the last summary",
+                    state.suppressed
                 ));
             }
             state.window_start = now;
@@ -114,6 +121,23 @@ impl AuditLog {
         } else {
             state.suppressed += 1;
         }
+    }
+
+    /// Emits the pending throttling summary, if any, without waiting for
+    /// the next window roll. The stats writer calls this periodically so a
+    /// grantee flood that stops is still accounted for (the summary used to
+    /// appear only on the next audit call).
+    pub(crate) fn flush_suppressed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suppressed == 0 {
+            return;
+        }
+        let suppressed = std::mem::take(&mut state.suppressed);
+        // Do not hold the audit mutex across the logging backend.
+        drop(state);
+        crate::logging::write_audit_entry(format_args!(
+            "admin audit log throttled: {suppressed} management entries suppressed since the last summary"
+        ));
     }
 
     /// The recent audit entries (oldest first), for tests.
@@ -181,6 +205,48 @@ mod tests {
         assert!(
             audit.recent().iter().any(|entry| entry == "admin mutation"),
             "an admin entry must survive a full grantee window"
+        );
+    }
+
+    #[test]
+    fn per_identity_cap_is_case_insensitive() {
+        let audit = AuditLog::default();
+        audit.clear();
+        let upper = "AA".repeat(32);
+        let lower = "aa".repeat(32);
+        for i in 0..MAX_PER_IDENTITY {
+            audit.log_for(upper.clone(), false, format!("upper {i}"));
+        }
+        audit.log_for(lower.clone(), false, "lower".into());
+        assert_eq!(
+            audit.state.lock().unwrap().suppressed,
+            1,
+            "alternating hex case must not multiply the per-identity budget"
+        );
+        assert!(
+            audit
+                .state
+                .lock()
+                .unwrap()
+                .per_identity
+                .contains_key(&lower),
+            "the canonical key is lowercase"
+        );
+    }
+
+    #[test]
+    fn flush_reports_and_clears_suppressed_entries() {
+        let audit = AuditLog::default();
+        audit.clear();
+        for i in 0..(MAX_PER_IDENTITY + 2) {
+            audit.log_for("flood".into(), false, format!("op {i}"));
+        }
+        assert_eq!(audit.state.lock().unwrap().suppressed, 2);
+        audit.flush_suppressed();
+        assert_eq!(
+            audit.state.lock().unwrap().suppressed,
+            0,
+            "the periodic flush must emit and clear the suppressed count"
         );
     }
 

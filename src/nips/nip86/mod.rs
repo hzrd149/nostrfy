@@ -85,8 +85,11 @@ const SUPPORTED_METHODS: &[&str] = &[
 /// `supportedmethods` is implicitly available to every authenticated
 /// caller (it shows their own subset), so it is not a grant target.
 /// Everything else — permission management itself, role and
-/// invite-claim management, and the relay identity — stays admin-only,
-/// so a grantee can never escalate.
+/// invite-claim management, the relay identity, and IP blocking — stays
+/// admin-only, so a grantee can never escalate or lock out the management
+/// surface. (`blockip` refuses every route from the address, including
+/// `/health` and the NIP-86 endpoint, so delegating it would let a grantee
+/// turn off the relay's administration.)
 pub(crate) const GRANTABLE_METHODS: &[&str] = &[
     "banpubkey",
     "unbanpubkey",
@@ -97,8 +100,6 @@ pub(crate) const GRANTABLE_METHODS: &[&str] = &[
     "allowkind",
     "disallowkind",
     "listallowedkinds",
-    "blockip",
-    "unblockip",
     "listblockedips",
     "banevent",
     "allowevent",
@@ -464,6 +465,12 @@ pub async fn rpc_handler(
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            // The optional reason is not stored for an unban, but a
+            // non-string in that position is a client bug and must not be
+            // silently ignored.
+            if let Err(e) = opt_param_str(params, 1, "reason") {
+                return rpc_err(&e);
+            }
             // Same validation as `banpubkey`: an unban must name a pubkey
             // (any string used to return a success reply).
             if !is_pubkey(pubkey) {
@@ -556,6 +563,9 @@ pub async fn rpc_handler(
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if let Err(e) = opt_param_str(params, 1, "reason") {
+                return rpc_err(&e);
+            }
             // Same validation as `allowpubkey`.
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
@@ -592,6 +602,15 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params");
             };
             {
+                let access = relay.access.read().await;
+                if !access.allowed_kinds.is_empty()
+                    && !access.allowed_kinds.contains(&kind)
+                    && access.allowed_kinds.len() >= MAX_ACCESS_ENTRIES
+                {
+                    return rpc_err("restricted: the allowed-kind list is full");
+                }
+            }
+            {
                 // NIP-86: allowing a kind also un-blocks it (matching the
                 // legacy endpoint), so `disallowkind` can be reverted. The
                 // conditional allow mirrors the call-site rule below: an
@@ -625,6 +644,14 @@ pub async fn rpc_handler(
             let Some(kind) = params.first().and_then(Value::as_u64) else {
                 return rpc_err("invalid params");
             };
+            {
+                let access = relay.access.read().await;
+                if !access.blocked_kinds.contains(&kind)
+                    && access.blocked_kinds.len() >= MAX_ACCESS_ENTRIES
+                {
+                    return rpc_err("restricted: the blocked-kind list is full");
+                }
+            }
             {
                 // A blocked kind must never be listed as allowed: drop it
                 // from the config allowlist (`listallowedkinds` reports that
@@ -750,7 +777,7 @@ pub async fn rpc_handler(
                 relay
                     .config_version
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                audit!(&relay, &identity, method, params);
+                audit_failure!(&relay, &identity, method, params);
                 return rpc_err("error: cannot persist the relay field");
             }
             audit!(&relay, &identity, method, params);
@@ -1171,11 +1198,18 @@ pub async fn rpc_handler(
             let _groups_in_flight = relay.begin_group_derived();
             let _roles_in_flight = relay.begin_role_derived();
             let outcome = relay.db.ban_event(id, reason).await;
-            audit!(&relay, &identity, "banevent", params);
             let (_, state_removed) = match outcome {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    audit!(&relay, &identity, "banevent", params);
+                    outcome
+                }
                 Err(e) => {
+                    audit_failure!(&relay, &identity, "banevent", params);
                     log::error!("banevent store failure: {e}");
+                    let message = e.to_string();
+                    if message.starts_with("restricted:") {
+                        return rpc_err(&message);
+                    }
                     return rpc_err("error: cannot persist the event ban");
                 }
             };
@@ -1207,13 +1241,16 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            // The optional reason slot is validated like its siblings
-            // (a non-string there is a client bug), though unbanning
-            // carries no reason.
+            // The optional reason is stored on the allow marker, so it
+            // follows the same bounds as `banevent` (length and control
+            // characters).
             let reason = match opt_param_str(params, 1, "reason") {
                 Ok(reason) => reason,
                 Err(e) => return rpc_err(&e),
             };
+            if let Err(e) = check_reason(reason) {
+                return rpc_err(&e.to_string());
+            }
             let Ok(id) = hex::decode(id) else {
                 return rpc_err("invalid event id");
             };
@@ -1226,11 +1263,16 @@ pub async fn rpc_handler(
             // like banning pre-bans. Only a store failure surfaces an
             // error.
             let outcome = relay.db.allow_event(id, reason).await;
-            audit!(&relay, &identity, "allowevent", params);
             if let Err(e) = outcome {
+                audit_failure!(&relay, &identity, "allowevent", params);
                 log::error!("allowevent store failure: {e}");
+                let message = e.to_string();
+                if message.starts_with("restricted:") {
+                    return rpc_err(&message);
+                }
                 return rpc_err("error: cannot persist the event allow");
             }
+            audit!(&relay, &identity, "allowevent", params);
             rpc_ok(json!(true))
         }
         "unallowevent" => {
@@ -1247,11 +1289,12 @@ pub async fn rpc_handler(
             // marker is a no-op success. Only a store failure surfaces
             // an error.
             let outcome = relay.db.unallow_event(id).await;
-            audit!(&relay, &identity, "unallowevent", params);
             if let Err(e) = outcome {
+                audit_failure!(&relay, &identity, "unallowevent", params);
                 log::error!("unallowevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unallow");
             }
+            audit!(&relay, &identity, "unallowevent", params);
             rpc_ok(json!(true))
         }
         "unbanevent" => {
@@ -1268,11 +1311,12 @@ pub async fn rpc_handler(
             // never-banned id is a no-op success. Only a store failure
             // surfaces an error.
             let outcome = relay.db.unban_event(id).await;
-            audit!(&relay, &identity, "unbanevent", params);
             if let Err(e) = outcome {
+                audit_failure!(&relay, &identity, "unbanevent", params);
                 log::error!("unbanevent store failure: {e}");
                 return rpc_err("error: cannot persist the event unban");
             }
+            audit!(&relay, &identity, "unbanevent", params);
             rpc_ok(json!(true))
         }
         "listbannedevents" => {
@@ -2237,6 +2281,16 @@ mod tests {
         assert!(rpc_err_of(resp).await.contains("params"));
         let resp = rpc_call(&relay, "allowevent", vec![json!("zz")]).await;
         assert!(rpc_err_of(resp).await.contains("event id"));
+        let resp = rpc_call(
+            &relay,
+            "allowevent",
+            vec![json!(id.clone()), json!("r".repeat(MAX_REASON_LEN + 1))],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("reason exceeds"),
+            "allowevent must validate the reason like banevent"
+        );
         let resp = rpc_call(&relay, "allowevent", vec![json!(id.clone())]).await;
         assert!(rpc_ok_of(resp).await);
         // Pre-ban: an unknown (future) id is banned, not an error.
@@ -2276,6 +2330,12 @@ mod tests {
         let recent = relay.audit.recent();
         assert!(recent.iter().any(|entry| entry.starts_with("banevent")));
         assert!(recent.iter().any(|entry| entry.starts_with("allowevent")));
+        assert!(
+            recent
+                .iter()
+                .any(|entry| entry.starts_with("allowevent") && entry.ends_with("(failed)")),
+            "a failed store must be audited as failed, not as a successful mutation"
+        );
         let resp = rpc_call(&relay, "listbannedevents", vec![]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = rpc_call(&relay, "listeventsneedingmoderation", vec![]).await;
@@ -2779,6 +2839,16 @@ mod tests {
         )
         .await;
         assert!(rpc_err_of(resp).await.contains("invalid method"));
+        // IP blocking refuses every route from the address, including the
+        // management API: delegating it would let a grantee lock out the
+        // relay's administration.
+        for method in ["blockip", "unblockip"] {
+            let resp = rpc_call(&relay, "assignmethod", vec![json!(agent_pk), json!(method)]).await;
+            assert!(
+                rpc_err_of(resp).await.contains("invalid method"),
+                "{method} must stay admin-only"
+            );
+        }
         let resp = rpc_call(&relay, "assignmethod", vec![json!("zz"), json!("banevent")]).await;
         assert!(rpc_err_of(resp).await.contains("pubkey"));
         // Grant + idempotent re-grant: the PR's `[true, message]` shape.
@@ -2944,6 +3014,8 @@ mod tests {
             let grants = access.method_grants.entry(agent_pk.clone()).or_default();
             grants.push("assignmethod".into());
             grants.push("createrole".into());
+            grants.push("blockip".into());
+            grants.push("unblockip".into());
             grants.push("listbannedevents".into());
         }
         let (_, resp) = nip98_call(
@@ -2964,13 +3036,20 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "an admin-only grant must not reach the method either"
         );
+        let (_, resp) = nip98_call(&relay, &agent, "blockip", vec![json!("127.0.0.1")]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a stale blockip grant must not lock out the relay"
+        );
         let (_, resp) = nip98_call(&relay, &agent, "supportedmethods", vec![]).await;
         let list = rpc_result_of(resp).await;
         let list = list.as_array().unwrap();
         assert!(
-            !list
-                .iter()
-                .any(|m| m == "assignmethod" || m == "createrole"),
+            !list.iter().any(|m| m == "assignmethod"
+                || m == "createrole"
+                || m == "blockip"
+                || m == "unblockip"),
             "discovery must filter non-grantable grants: {list:?}"
         );
         assert!(
@@ -3212,7 +3291,7 @@ mod tests {
         // A non-string reason must fail instead of being silently dropped
         // (absent/null still means no reason).
         let relay = build_admin_relay().await;
-        for method in ["banpubkey", "allowpubkey"] {
+        for method in ["banpubkey", "allowpubkey", "unbanpubkey", "unallowpubkey"] {
             let resp = rpc_call(&relay, method, vec![json!("aa".repeat(32)), json!(7)]).await;
             assert!(
                 rpc_err_of(resp).await.contains("reason must be a string"),
@@ -3223,6 +3302,33 @@ mod tests {
         }
         let resp = rpc_call(&relay, "blockip", vec![json!("127.0.0.1"), json!(true)]).await;
         assert!(rpc_err_of(resp).await.contains("reason must be a string"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn kind_lists_are_bounded() {
+        let relay = build_admin_relay().await;
+        relay.access.write().await.blocked_kinds = (0..MAX_ACCESS_ENTRIES as u64).collect();
+        let resp = rpc_call(
+            &relay,
+            "disallowkind",
+            vec![json!(MAX_ACCESS_ENTRIES as u64)],
+        )
+        .await;
+        assert!(
+            rpc_err_of(resp).await.contains("blocked-kind list is full"),
+            "a new kind at the blocked-kind cap must be refused"
+        );
+        // Re-blocking an existing kind does not grow the list.
+        let resp = rpc_call(&relay, "disallowkind", vec![json!(0)]).await;
+        assert!(rpc_ok_of(resp).await);
+
+        relay.access.write().await.allowed_kinds = (0..MAX_ACCESS_ENTRIES as u64).collect();
+        let resp = rpc_call(&relay, "allowkind", vec![json!(MAX_ACCESS_ENTRIES as u64)]).await;
+        assert!(
+            rpc_err_of(resp).await.contains("allowed-kind list is full"),
+            "a new kind at the allowed-kind cap must be refused"
+        );
         relay.db.shutdown();
     }
 
